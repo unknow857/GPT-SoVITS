@@ -41,10 +41,45 @@ run_conda_quiet() {
 
 run_pip_quiet() {
     local output
-    output=$(pip install "$@" 2>&1) || {
+    output=$(python -m pip install "$@" 2>&1) || {
         echo -e "${ERROR} Pip install failed:\n$output"
         exit 1
     }
+}
+
+check_python_runtime() {
+    local output
+    output=$(python - <<'PY' 2>&1
+import platform
+import sys
+
+impl = platform.python_implementation()
+version = ".".join(map(str, sys.version_info[:3]))
+print(f"{impl} {version}")
+
+if impl != "CPython":
+    print(
+        "PyTorch wheels require CPython. The active Python is "
+        f"{impl}; create and activate a CPython conda environment, for example: "
+        "conda create -n GPTSoVits python=3.10 && conda activate GPTSoVits",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+if not ((3, 9) <= sys.version_info[:2] < (3, 13)):
+    print(
+        "Unsupported Python version for this installer. Use CPython 3.10 or 3.11 "
+        f"for the best PyTorch compatibility; active version is {version}.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+    ) || {
+        echo -e "${ERROR} Python runtime check failed:\n$output"
+        exit 1
+    }
+
+    echo -e "${INFO}Detected Python Runtime: $output"
 }
 
 run_wget_quiet() {
@@ -57,11 +92,6 @@ run_wget_quiet() {
         exit 1
     fi
 }
-
-if ! command -v conda &>/dev/null; then
-    echo -e "${ERROR}Conda Not Found"
-    exit 1
-fi
 
 USE_CUDA=false
 USE_ROCM=false
@@ -172,6 +202,13 @@ if ! $USE_HF && ! $USE_HF_MIRROR && ! $USE_MODELSCOPE; then
     print_help
     exit 1
 fi
+
+if ! command -v conda &>/dev/null; then
+    echo -e "${ERROR}Conda Not Found"
+    exit 1
+fi
+
+check_python_runtime
 
 case "$(uname -m)" in
 x86_64 | amd64) SYSROOT_PKG="sysroot_linux-64>=2.28" ;;
@@ -359,7 +396,7 @@ PYOPENJTALK_PREFIX=$(python -c "import os, pyopenjtalk; print(os.path.dirname(py
 echo -e "${INFO}Downloading NLTK Data..."
 rm -rf nltk_data.zip
 run_wget_quiet "$NLTK_URL" -O nltk_data.zip
-unzip -q -o nltk_data -d "$PY_PREFIX"
+unzip -q -o nltk_data.zip -d "$PY_PREFIX"
 rm -rf nltk_data.zip
 echo -e "${SUCCESS}NLTK Data Downloaded"
 
@@ -372,7 +409,7 @@ echo -e "${SUCCESS}Open JTalk Dic Downloaded"
 
 if [ "$USE_ROCM" = true ] && [ "$IS_WSL" = true ]; then
     echo -e "${INFO}Updating WSL Compatible Runtime Lib For ROCm..."
-    location=$(pip show torch | grep Location | awk -F ": " '{print $2}')
+    location=$(python -m pip show torch | grep Location | awk -F ": " '{print $2}')
     cd "${location}"/torch/lib/ || exit
     rm libhsa-runtime64.so*
     cp "$(readlink -f /opt/rocm/lib/libhsa-runtime64.so)" libhsa-runtime64.so
