@@ -49,6 +49,9 @@ run_pip_quiet() {
 
 check_python_runtime() {
     local output
+    local status
+
+    set +e
     output=$(python - <<'PY' 2>&1
 import platform
 import subprocess
@@ -71,7 +74,8 @@ if impl != "cpython" or not cache_tag.startswith("cpython-") or (soabi and not s
         f"implementation/ABI is implementation={impl}, abi={soabi or cache_tag}. "
         "GraalPy/PyPy cannot install the official torch CUDA wheels. Create and "
         "activate a fresh CPython conda environment, for example: "
-        "conda create -n GPTSoVITS python=3.10 && conda activate GPTSoVITS",
+        "conda create -n GPTSoVITS -c conda-forge python=3.10 "
+        "\"python_abi=3.10=*_cp310\" pip && conda activate GPTSoVITS",
         file=sys.stderr,
     )
     raise SystemExit(1)
@@ -102,15 +106,25 @@ if "graalpy" in pip_output.lower():
         "The active python -m pip is using GraalPy's pip hook, which makes pip "
         "select GraalPy-compatible wheels instead of CPython wheels. Recreate the "
         "environment with CPython before running this installer: "
-        "conda create -n GPTSoVITS python=3.10 && conda activate GPTSoVITS",
+        "conda create -n GPTSoVITS -c conda-forge python=3.10 "
+        "\"python_abi=3.10=*_cp310\" pip && conda activate GPTSoVITS",
         file=sys.stderr,
     )
     raise SystemExit(1)
 PY
-    ) || {
+    )
+    status=$?
+    set -e
+
+    if [ "$status" -ne 0 ]; then
         echo -e "${ERROR} Python runtime check failed:\n$output"
         exit 1
-    }
+    fi
+
+    if printf '%s\n' "$output" | grep -Eiq 'implementation=(graalpy|pypy)|abi=(graalpy|pypy)|GraalPy/PyPy cannot|graalpy\.pip_hook'; then
+        echo -e "${ERROR} Python runtime check failed:\n$output"
+        exit 1
+    fi
 
     echo -e "${INFO}Detected Python Runtime: $output"
 }
@@ -128,6 +142,31 @@ PY
     }
 
     echo -e "${INFO}Detected PyTorch: $output"
+}
+
+verify_psutil_install() {
+    local output
+    output=$(python - <<'PY' 2>&1
+import psutil
+
+print(f"psutil {psutil.__version__}")
+PY
+    ) || {
+        echo -e "${WARNING}psutil import failed, reinstalling psutil:\n$output"
+        run_pip_quiet --force-reinstall --no-cache-dir psutil
+
+        output=$(python - <<'PY' 2>&1
+import psutil
+
+print(f"psutil {psutil.__version__}")
+PY
+        ) || {
+            echo -e "${ERROR} psutil import check failed after reinstall:\n$output"
+            exit 1
+        }
+    }
+
+    echo -e "${INFO}Detected psutil: $output"
 }
 
 run_wget_quiet() {
@@ -460,6 +499,8 @@ hash -r
 run_pip_quiet -r extra-req.txt --no-deps
 
 run_pip_quiet -r requirements.txt
+
+verify_psutil_install
 
 echo -e "${SUCCESS}Python Dependencies Installed"
 
