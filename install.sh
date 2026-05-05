@@ -51,25 +51,58 @@ check_python_runtime() {
     local output
     output=$(python - <<'PY' 2>&1
 import platform
+import subprocess
 import sys
+import sysconfig
 
-impl = platform.python_implementation()
 version = ".".join(map(str, sys.version_info[:3]))
-print(f"{impl} {version}")
+impl = getattr(sys.implementation, "name", "").lower()
+cache_tag = getattr(sys.implementation, "cache_tag", "") or ""
+soabi = sysconfig.get_config_var("SOABI") or ""
 
-if impl != "CPython":
+print(
+    f"{platform.python_implementation()} {version}; "
+    f"implementation={impl}; abi={soabi or cache_tag}; executable={sys.executable}"
+)
+
+if impl != "cpython" or not cache_tag.startswith("cpython-") or (soabi and not soabi.startswith("cpython-")):
     print(
-        "PyTorch wheels require CPython. The active Python is "
-        f"{impl}; create and activate a CPython conda environment, for example: "
-        "conda create -n GPTSoVits python=3.10 && conda activate GPTSoVits",
+        "PyTorch wheels require the standard CPython ABI. The active Python "
+        f"implementation/ABI is implementation={impl}, abi={soabi or cache_tag}. "
+        "GraalPy/PyPy cannot install the official torch CUDA wheels. Create and "
+        "activate a fresh CPython conda environment, for example: "
+        "conda create -n GPTSoVITS python=3.10 && conda activate GPTSoVITS",
         file=sys.stderr,
     )
     raise SystemExit(1)
 
 if not ((3, 9) <= sys.version_info[:2] < (3, 13)):
     print(
-        "Unsupported Python version for this installer. Use CPython 3.10 or 3.11 "
+        "Unsupported Python version for this installer. Use CPython 3.10-3.12 "
         f"for the best PyTorch compatibility; active version is {version}.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+pip_probe = subprocess.run(
+    [sys.executable, "-m", "pip", "--version"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+)
+pip_output = pip_probe.stdout.strip()
+print(f"pip: {pip_output}")
+
+if pip_probe.returncode != 0:
+    print("Unable to run python -m pip in the active environment.", file=sys.stderr)
+    raise SystemExit(1)
+
+if "graalpy" in pip_output.lower():
+    print(
+        "The active python -m pip is using GraalPy's pip hook, which makes pip "
+        "select GraalPy-compatible wheels instead of CPython wheels. Recreate the "
+        "environment with CPython before running this installer: "
+        "conda create -n GPTSoVITS python=3.10 && conda activate GPTSoVITS",
         file=sys.stderr,
     )
     raise SystemExit(1)
@@ -80,6 +113,21 @@ PY
     }
 
     echo -e "${INFO}Detected Python Runtime: $output"
+}
+
+verify_torch_install() {
+    local output
+    output=$(python - <<'PY' 2>&1
+import torch
+
+print(f"torch {torch.__version__}, cuda={torch.version.cuda}")
+PY
+    ) || {
+        echo -e "${ERROR} PyTorch import check failed:\n$output"
+        exit 1
+    }
+
+    echo -e "${INFO}Detected PyTorch: $output"
 }
 
 run_wget_quiet() {
@@ -97,6 +145,16 @@ USE_CUDA=false
 USE_ROCM=false
 USE_CPU=false
 WORKFLOW=${WORKFLOW:-"false"}
+case "$WORKFLOW" in
+true | false) ;;
+1 | yes | YES | Yes | TRUE | True) WORKFLOW=true ;;
+0 | no | NO | No | FALSE | False | "") WORKFLOW=false ;;
+*)
+    echo -e "${WARNING}Invalid WORKFLOW value: $WORKFLOW, fallback to false"
+    WORKFLOW=false
+    ;;
+esac
+SKIP_PRE_TORCH_STEPS=$WORKFLOW
 
 USE_HF=false
 USE_HF_MIRROR=false
@@ -209,6 +267,10 @@ if ! command -v conda &>/dev/null; then
 fi
 
 check_python_runtime
+echo -e "${INFO}WORKFLOW=$WORKFLOW"
+if [ "$SKIP_PRE_TORCH_STEPS" = true ]; then
+    echo -e "${INFO}WORKFLOW=true only skips setup and model-download steps before PyTorch"
+fi
 
 case "$(uname -m)" in
 x86_64 | amd64) SYSROOT_PKG="sysroot_linux-64>=2.28" ;;
@@ -220,6 +282,9 @@ ppc64le) SYSROOT_PKG="sysroot_linux-ppc64le>=2.28" ;;
     ;;
 esac
 
+if [ "$SKIP_PRE_TORCH_STEPS" = true ]; then
+    echo -e "${INFO}Skipping setup steps before PyTorch"
+else
 # Install build tools
 echo -e "${INFO}Detected system: $(uname -s) $(uname -r) $(uname -m)"
 if [ "$(uname)" != "Darwin" ]; then
@@ -267,6 +332,7 @@ echo -e "${SUCCESS}FFmpeg & CMake Installed"
 echo -e "${INFO}Installing unzip..."
 run_conda_quiet unzip
 echo -e "${SUCCESS}unzip Installed"
+fi
 
 if [ "$USE_HF" = "true" ]; then
     echo -e "${INFO}Download Model From HuggingFace"
@@ -291,6 +357,9 @@ elif [ "$USE_MODELSCOPE" = "true" ]; then
     PYOPENJTALK_URL="https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/open_jtalk_dic_utf_8-1.11.tar.gz"
 fi
 
+if [ "$SKIP_PRE_TORCH_STEPS" = true ]; then
+    echo -e "${INFO}Skipping model downloads before PyTorch"
+else
 if [ ! -d "GPT_SoVITS/pretrained_models/sv" ]; then
     echo -e "${INFO}Downloading Pretrained Models..."
     rm -rf pretrained_models.zip
@@ -331,8 +400,11 @@ if [ "$DOWNLOAD_UVR5" = "true" ]; then
         echo -e "${SUCCESS}UVR5 Models Downloaded"
     fi
 fi
+fi
 
-if [ "$USE_CUDA" = true ] && [ "$WORKFLOW" = false ]; then
+# WORKFLOW/SKIP_PRE_TORCH_STEPS stops here. PyTorch and all later dependencies
+# are still installed so interrupted runs can resume from the torch step.
+if [ "$USE_CUDA" = true ]; then
     echo -e "${INFO}Checking For Nvidia Driver Installation..."
     if command -v nvidia-smi &>/dev/null; then
         echo "${INFO}Nvidia Driver Founded"
@@ -343,7 +415,7 @@ if [ "$USE_CUDA" = true ] && [ "$WORKFLOW" = false ]; then
     fi
 fi
 
-if [ "$USE_ROCM" = true ] && [ "$WORKFLOW" = false ]; then
+if [ "$USE_ROCM" = true ]; then
     echo -e "${INFO}Checking For ROCm Installation..."
     if [ -d "/opt/rocm" ]; then
         echo -e "${INFO}ROCm Founded"
@@ -360,7 +432,7 @@ if [ "$USE_ROCM" = true ] && [ "$WORKFLOW" = false ]; then
     fi
 fi
 
-if [ "$USE_CUDA" = true ] && [ "$WORKFLOW" = false ]; then
+if [ "$USE_CUDA" = true ]; then
     if [ "$CUDA" = 128 ]; then
         echo -e "${INFO}Installing PyTorch For CUDA 12.8..."
         run_pip_quiet torch torchcodec --index-url "https://download.pytorch.org/whl/cu128"
@@ -368,16 +440,17 @@ if [ "$USE_CUDA" = true ] && [ "$WORKFLOW" = false ]; then
         echo -e "${INFO}Installing PyTorch For CUDA 12.6..."
         run_pip_quiet torch torchcodec --index-url "https://download.pytorch.org/whl/cu126"
     fi
-elif [ "$USE_ROCM" = true ] && [ "$WORKFLOW" = false ]; then
+elif [ "$USE_ROCM" = true ]; then
     echo -e "${INFO}Installing PyTorch For ROCm 6.2..."
     run_pip_quiet torch torchcodec --index-url "https://download.pytorch.org/whl/rocm6.2"
-elif [ "$USE_CPU" = true ] && [ "$WORKFLOW" = false ]; then
+elif [ "$USE_CPU" = true ]; then
     echo -e "${INFO}Installing PyTorch For CPU..."
     run_pip_quiet torch torchcodec --index-url "https://download.pytorch.org/whl/cpu"
-elif [ "$WORKFLOW" = false ]; then
+else
     echo -e "${ERROR}Unknown Err"
     exit 1
 fi
+verify_torch_install
 echo -e "${SUCCESS}PyTorch Installed"
 
 echo -e "${INFO}Installing Python Dependencies From requirements.txt..."
